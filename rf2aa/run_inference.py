@@ -8,7 +8,7 @@ from rf2aa.data.merge_inputs import merge_all
 from rf2aa.data.covale import load_covalent_molecules, load_residue_replacement
 from rf2aa.data.nucleic_acid import load_nucleic_acid
 from rf2aa.data.protein import generate_msa_and_load_protein
-from rf2aa.data.small_molecule import load_small_molecule
+from rf2aa.data.small_molecule import load_small_molecule, load_multiple_small_molecule
 from rf2aa.ffindex import *
 from rf2aa.chemical import initialize_chemdata, load_pdb_ideal_sdf_strings
 from rf2aa.chemical import ChemicalData as ChemData
@@ -17,7 +17,12 @@ from rf2aa.training.recycling import recycle_step_legacy
 from rf2aa.util import writepdb, is_atom, Ls_from_same_chain_2d
 from rf2aa.util_module import XYZConverter
 
+from time import time
 
+def _prepare_raw_data(protein_inputs, na_inputs, sm_inputs, residues_to_atomize, deterministic):
+     raw_data = merge_all(protein_inputs, na_inputs, sm_inputs, residues_to_atomize, deterministic=deterministic)
+     return raw_data
+        
 class ModelRunner:
 
     def __init__(self, config) -> None:
@@ -60,7 +65,8 @@ class ModelRunner:
                 )
                 na_inputs[chain] = na_input
 
-        sm_inputs = {} 
+        sm_inputs = {}
+        sm_mol_ids = {}
         # first if any of the small molecules are covalently bonded to the protein
         # merge the small molecule with the residue and add it as a separate ligand
         # also add it to residues_to_atomize for bookkeeping later on
@@ -72,7 +78,7 @@ class ModelRunner:
             
         if self.config.sm_inputs is not None:
             for chain in self.config.sm_inputs:
-                if self.config.sm_inputs[chain]["input_type"] not in ["smiles", "sdf"]:
+                if self.config.sm_inputs[chain]["input_type"] not in ["smiles", "sdf", "smiles_file"]:
                     raise ValueError("Small molecule input type must be smiles or sdf")
                 if chain in sm_inputs: # chain already processed as covale
                     continue
@@ -94,9 +100,29 @@ class ModelRunner:
                 sm_inputs, residues_to_atomize_replacement = load_residue_replacement(self.config.residue_replacement, self)
                 sm_inputs.update(sm_inputs)
                 residues_to_atomize.extend(residues_to_atomize_replacement)
-        raw_data = merge_all(protein_inputs, na_inputs, sm_inputs, residues_to_atomize, deterministic=self.deterministic)
-        self.raw_data = raw_data
 
+        if self.config.sm_screen_inputs:
+            for chain in self.config.sm_screen_inputs:
+                if self.config.sm_screen_inputs[chain]["input_type"] not in ["smiles", "sdf", "smiles_file"]:
+                    raise ValueError("Small molecule input type must be smiles or sdf")
+                if chain in sm_inputs: # chain already processed as covale
+                    continue
+                if "is_leaving" in self.config.sm_screen_inputs[chain]:
+                    raise ValueError("Leaving atoms are not supported for non-covalently bonded molecules")
+                sm_input, molids = load_multiple_small_molecule(
+                   self.config.sm_screen_inputs[chain]["input"],
+                   self.config.sm_screen_inputs[chain]["input_type"],
+                   self
+                )
+                sm_inputs[chain] = sm_input
+                sm_mol_ids[chain] = molids
+                
+        self.protein_inputs = protein_inputs
+        self.na_inputs = na_inputs
+        self.sm_inputs = sm_inputs
+        self.residues_to_atomize = residues_to_atomize
+        self.sm_mol_ids = sm_mol_ids
+        
     def load_model(self):
         self.model = RoseTTAFoldModule(
             **self.config.legacy_model_param,
@@ -113,7 +139,9 @@ class ModelRunner:
         checkpoint = torch.load(self.config.checkpoint_path, map_location=self.device)
         self.model.load_state_dict(checkpoint['model_state_dict'])
 
-    def construct_features(self):
+    def construct_features(self, raw_data=None):
+        if raw_data is not None:
+            return raw_data.construct_features(self)
         return self.raw_data.construct_features(self)
 
     def run_model_forward(self, input_feats):
@@ -131,7 +159,7 @@ class ModelRunner:
         return outputs
 
 
-    def write_outputs(self, input_feats, outputs):
+    def write_outputs(self, input_feats, outputs, extra=""):
         logits, logits_aa, logits_pae, logits_pde, p_bind, \
                 xyz, alpha_s, xyz_allatom, lddt, _, _, _ \
             = outputs
@@ -142,7 +170,7 @@ class ModelRunner:
         plddts = err_dict["plddts"]
         Ls = Ls_from_same_chain_2d(input_feats.same_chain)
         plddts = plddts[0]
-        writepdb(os.path.join(f"{self.config.output_path}", f"{self.config.job_name}.pdb"), 
+        writepdb(os.path.join(f"{self.config.output_path}", f"{self.config.job_name}{extra}.pdb"), 
                  xyz_allatom, 
                  seq_unmasked, 
                  bond_feats=bond_feats,
@@ -150,14 +178,29 @@ class ModelRunner:
                  chain_Ls=Ls
                  )
         torch.save(err_dict, os.path.join(f"{self.config.output_path}", 
-                                          f"{self.config.job_name}_aux.pt"))
+                                          f"{self.config.job_name}{extra}_aux.pt"))
 
     def infer(self):
         self.load_model()
         self.parse_inference_config()
-        input_feats = self.construct_features()
-        outputs = self.run_model_forward(input_feats)
-        self.write_outputs(input_feats, outputs)
+        if self.config.sm_screen_inputs:
+            sm_input = {}
+            for key in self.config.sm_screen_inputs:
+                for sm_input_feat, sm_molid in zip(self.sm_inputs[key], self.sm_mol_ids[key]):
+                    t0 = time()
+                    sm_input[key] = sm_input_feat
+                    raw_data = _prepare_raw_data(self.protein_inputs, self.na_inputs, sm_input, self.residues_to_atomize, self.deterministic)
+                    self.raw_data = raw_data
+                    input_feats = self.construct_features()
+                    outputs = self.run_model_forward(input_feats)
+                    self.write_outputs(input_feats, outputs, extra=f"_{sm_molid}")
+                    print(f"Finished inference for {sm_molid} in {time()-t0:.2f}s")
+        else:
+            raw_data = _prepare_raw_data(self.protein_inputs, self.na_inputs, self.sm_inputs, self.residues_to_atomize, self.deterministic)
+            self.raw_data = raw_data
+            input_feats = self.construct_features()
+            outputs = self.run_model_forward(input_feats)
+            self.write_outputs(input_feats, outputs)
 
     def lddt_unbin(self, pred_lddt):
         # calculate lddt prediction loss

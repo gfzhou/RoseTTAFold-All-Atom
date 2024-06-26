@@ -6,6 +6,19 @@ from rf2aa.data.parsers import parse_mol
 from rf2aa.kinematics import get_chirals
 from rf2aa.util import get_bond_feats, get_nxgraph, get_atom_frames
 
+def load_multiple_small_molecule(input_file, input_type, model_runner):
+    feats = []
+    molids = []
+    is_string=True
+    with open(input_file, 'r') as infh:
+        for l in infh:
+            obmol, msa, ins, xyz, mask = parse_mol(
+                l.strip(), filetype=input_type, string=is_string, generate_conformer=True
+            )
+            feats.append( compute_features_from_obmol(obmol, msa, xyz, model_runner) )
+            molids.append(obmol.GetTitle())
+    return feats, molids
+            
 
 def load_small_molecule(input_file, input_type, model_runner):
     if input_type == "smiles":
